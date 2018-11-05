@@ -1,18 +1,15 @@
 package authorization
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"strings"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/docker/docker/pkg/ioutils"
 )
-
-const maxBodySize = 1048576 // 1MB
 
 // NewCtx creates new authZ context, it is used to store authorization information related to a specific docker
 // REST http session
@@ -20,7 +17,7 @@ const maxBodySize = 1048576 // 1MB
 // Authenticate Request:
 // Call authZ plugins with current REST request and AuthN response
 // Request contains full HTTP packet sent to the docker daemon
-// https://docs.docker.com/engine/reference/api/
+// https://docs.docker.com/reference/api/docker_remote_api/
 //
 // Authenticate Response:
 // Call authZ plugins with full info about current REST request, REST response and AuthN response
@@ -40,7 +37,7 @@ func NewCtx(authZPlugins []Plugin, user, userAuthNMethod, requestMethod, request
 	}
 }
 
-// Ctx stores a single request-response interaction context
+// Ctx stores a a single request-response interaction context
 type Ctx struct {
 	user            string
 	userAuthNMethod string
@@ -54,9 +51,17 @@ type Ctx struct {
 // AuthZRequest authorized the request to the docker daemon using authZ plugins
 func (ctx *Ctx) AuthZRequest(w http.ResponseWriter, r *http.Request) error {
 	var body []byte
-	if sendBody(ctx.requestURI, r.Header) && r.ContentLength > 0 && r.ContentLength < maxBodySize {
-		var err error
-		body, r.Body, err = drainBody(r.Body)
+	if sendBody(ctx.requestURI, r.Header) {
+		var (
+			err         error
+			drainedBody io.ReadCloser
+		)
+		drainedBody, r.Body, err = drainBody(r.Body)
+		if err != nil {
+			return err
+		}
+		defer drainedBody.Close()
+		body, err = ioutil.ReadAll(drainedBody)
 		if err != nil {
 			return err
 		}
@@ -76,13 +81,6 @@ func (ctx *Ctx) AuthZRequest(w http.ResponseWriter, r *http.Request) error {
 		RequestHeaders:  headers(r.Header),
 	}
 
-	if r.TLS != nil {
-		for _, c := range r.TLS.PeerCertificates {
-			pc := PeerCertificate(*c)
-			ctx.authReq.RequestPeerCertificates = append(ctx.authReq.RequestPeerCertificates, &pc)
-		}
-	}
-
 	for _, plugin := range ctx.plugins {
 		logrus.Debugf("AuthZ request using plugin %s", plugin.Name())
 
@@ -92,7 +90,7 @@ func (ctx *Ctx) AuthZRequest(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		if !authRes.Allow {
-			return newAuthorizationError(plugin.Name(), authRes.Msg)
+			return fmt.Errorf("authorization denied by plugin %s: %s", plugin.Name(), authRes.Msg)
 		}
 	}
 
@@ -117,32 +115,26 @@ func (ctx *Ctx) AuthZResponse(rm ResponseModifier, r *http.Request) error {
 		}
 
 		if !authRes.Allow {
-			return newAuthorizationError(plugin.Name(), authRes.Msg)
+			return fmt.Errorf("authorization denied by plugin %s: %s", plugin.Name(), authRes.Msg)
 		}
 	}
 
-	rm.FlushAll()
+	rm.Flush()
 
 	return nil
 }
 
-// drainBody dump the body (if its length is less than 1MB) without modifying the request state
-func drainBody(body io.ReadCloser) ([]byte, io.ReadCloser, error) {
-	bufReader := bufio.NewReaderSize(body, maxBodySize)
-	newBody := ioutils.NewReadCloserWrapper(bufReader, func() error { return body.Close() })
-
-	data, err := bufReader.Peek(maxBodySize)
-	// Body size exceeds max body size
-	if err == nil {
-		logrus.Warnf("Request body is larger than: '%d' skipping body", maxBodySize)
-		return nil, newBody, nil
+// drainBody dump the body, it reads the body data into memory and
+// see go sources /go/src/net/http/httputil/dump.go
+func drainBody(b io.ReadCloser) (io.ReadCloser, io.ReadCloser, error) {
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(b); err != nil {
+		return nil, nil, err
 	}
-	// Body size is less than maximum size
-	if err == io.EOF {
-		return data, newBody, nil
+	if err := b.Close(); err != nil {
+		return nil, nil, err
 	}
-	// Unknown error
-	return nil, newBody, err
+	return ioutil.NopCloser(&buf), ioutil.NopCloser(bytes.NewReader(buf.Bytes())), nil
 }
 
 // sendBody returns true when request/response body should be sent to AuthZPlugin
@@ -153,7 +145,8 @@ func sendBody(url string, header http.Header) bool {
 	}
 
 	// body is sent only for text or json messages
-	return header.Get("Content-Type") == "application/json"
+	v := header.Get("Content-Type")
+	return strings.HasPrefix(v, "text/") || v == "application/json"
 }
 
 // headers returns flatten version of the http headers excluding authorization
@@ -169,18 +162,4 @@ func headers(header http.Header) map[string]string {
 		}
 	}
 	return v
-}
-
-// authorizationError represents an authorization deny error
-type authorizationError struct {
-	error
-}
-
-// HTTPErrorStatusCode returns the authorization error status code (forbidden)
-func (e authorizationError) HTTPErrorStatusCode() int {
-	return http.StatusForbidden
-}
-
-func newAuthorizationError(plugin, msg string) authorizationError {
-	return authorizationError{error: fmt.Errorf("authorization denied by plugin %s: %s", plugin, msg)}
 }
